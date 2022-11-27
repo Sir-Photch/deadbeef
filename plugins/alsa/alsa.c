@@ -56,6 +56,9 @@ static snd_pcm_uframes_t period_size;
 static snd_pcm_uframes_t req_buffer_size;
 static snd_pcm_uframes_t req_period_size;
 
+static snd_mixer_t *mixer;
+static snd_mixer_elem_t *mixer_element;
+
 static int conf_alsa_resample = 1;
 static char conf_alsa_soundcard[100] = "default";
 
@@ -230,6 +233,7 @@ palsa_set_hw_params (ddb_waveformat_t *fmt) {
                 snd_strerror (err));
         goto error;
     }
+    
     plugin.fmt.samplerate = val;
     trace ("chosen samplerate: %d Hz\n", val);
 
@@ -336,9 +340,62 @@ error:
     return err;
 }
 
+static int open_mixer(void) {
+    int err;
+
+    mixer = NULL;
+    static const char mixer_name[] = "default";
+
+    if ((err = snd_mixer_open(&mixer, 0)) < 0) {
+        fprintf(stderr, "Could not open mixer (%s)\n", snd_strerror(err));
+        goto error;
+    }
+
+    if ((err = snd_mixer_attach(mixer, mixer_name)) < 0) {
+        fprintf(stderr, "Could not attach mixer (%s)\n", snd_strerror(err));
+        goto error;
+    }
+
+    if ((err = snd_mixer_selem_register(mixer, NULL, NULL)) < 0) {
+        fprintf(stderr, "Could not register elements (%s)\n", snd_strerror(err));
+        goto error;
+    }
+
+    if ((err = snd_mixer_load(mixer)) < 0) {
+        fprintf(stderr, "Could not load mixer (%s)\n", snd_strerror(err));
+        goto error;
+    }
+
+    if (!(mixer_element = snd_mixer_first_elem(mixer))) {
+        fprintf(stderr, "No mixer element available!\n");
+        goto error;
+    }
+
+    if ((err = snd_mixer_selem_set_playback_volume_range(mixer_element, 0, 100)) < 0) {
+        fprintf(stderr, "Could not set volume range (%s)\n", snd_strerror(err));
+        goto error;
+    }
+
+    return 0;
+
+error:
+    if (mixer) {
+        snd_mixer_close(mixer);
+        mixer = NULL;
+    }
+    return err;
+}
+
 static int
 palsa_init (void) {
     int err;
+
+
+    if ((err = open_mixer())) {
+        fprintf(stderr, "could not open mixer (%s)\n", snd_strerror(err));
+        return -1;
+    }
+
 
     // get and cache conf variables
     conf_alsa_resample = deadbeef->conf_get_int ("alsa.resample", 1);
@@ -453,6 +510,7 @@ _setformat_apply (void) {
         , requested_fmt.channelmask, plugin.fmt.channelmask
         );
     }
+
     int ret = palsa_set_hw_params (&requested_fmt);
     if (ret < 0) {
         trace ("palsa_setformat: impossible to set requested format\n");
@@ -460,6 +518,7 @@ _setformat_apply (void) {
         memcpy (&plugin.fmt, &requested_fmt, sizeof (ddb_waveformat_t));
         return -1;
     }
+
     trace ("new format %dbit %s %dch %dHz channelmask=%X\n", plugin.fmt.bps, plugin.fmt.is_float ? "float" : "int", plugin.fmt.channels, plugin.fmt.samplerate, plugin.fmt.channelmask);
     return 0;
 }
@@ -635,7 +694,7 @@ palsa_thread (void *context) {
         // setformat
         int res = 0;
         if (_setformat_requested) {
-            res = _setformat_apply ();
+            res = _setformat_apply ();   
         }
 
         if (res != 0) {
@@ -819,7 +878,7 @@ static DB_output_t plugin = {
     .plugin.version_major = 1,
     .plugin.version_minor = 0,
     .plugin.type = DB_PLUGIN_OUTPUT,
-//    .plugin.flags = DDB_PLUGIN_FLAG_LOGGING,
+    .plugin.flags = DDB_PLUGIN_FLAG_LOGGING,
     .plugin.id = "alsa",
     .plugin.name = "ALSA output plugin",
     .plugin.descr = "plays sound through linux standard alsa library",
