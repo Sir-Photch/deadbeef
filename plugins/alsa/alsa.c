@@ -69,7 +69,7 @@ static void
 palsa_thread (void *context);
 
 static int
-palsa_init (void);
+palsa_init (int spawn);
 
 static int
 palsa_free (void);
@@ -340,62 +340,9 @@ error:
     return err;
 }
 
-static int open_mixer(void) {
-    int err;
-
-    mixer = NULL;
-    static const char mixer_name[] = "default";
-
-    if ((err = snd_mixer_open(&mixer, 0)) < 0) {
-        fprintf(stderr, "Could not open mixer (%s)\n", snd_strerror(err));
-        goto error;
-    }
-
-    if ((err = snd_mixer_attach(mixer, mixer_name)) < 0) {
-        fprintf(stderr, "Could not attach mixer (%s)\n", snd_strerror(err));
-        goto error;
-    }
-
-    if ((err = snd_mixer_selem_register(mixer, NULL, NULL)) < 0) {
-        fprintf(stderr, "Could not register elements (%s)\n", snd_strerror(err));
-        goto error;
-    }
-
-    if ((err = snd_mixer_load(mixer)) < 0) {
-        fprintf(stderr, "Could not load mixer (%s)\n", snd_strerror(err));
-        goto error;
-    }
-
-    if (!(mixer_element = snd_mixer_first_elem(mixer))) {
-        fprintf(stderr, "No mixer element available!\n");
-        goto error;
-    }
-
-    if ((err = snd_mixer_selem_set_playback_volume_range(mixer_element, 0, 100)) < 0) {
-        fprintf(stderr, "Could not set volume range (%s)\n", snd_strerror(err));
-        goto error;
-    }
-
-    return 0;
-
-error:
-    if (mixer) {
-        snd_mixer_close(mixer);
-        mixer = NULL;
-    }
-    return err;
-}
-
 static int
-palsa_init (void) {
+palsa_init (int spawn) {
     int err;
-
-
-    if ((err = open_mixer())) {
-        fprintf(stderr, "could not open mixer (%s)\n", snd_strerror(err));
-        return -1;
-    }
-
 
     // get and cache conf variables
     conf_alsa_resample = deadbeef->conf_get_int ("alsa.resample", 1);
@@ -409,7 +356,7 @@ palsa_init (void) {
         fprintf (stderr, "could not open audio device (%s)\n",
                 snd_strerror (err));
         return -1;
-    }
+    }    
 
     if (requested_fmt.samplerate != 0) {
         memcpy (&plugin.fmt, &requested_fmt, sizeof (ddb_waveformat_t));
@@ -480,7 +427,7 @@ open_error:
     if (sw_params) {
         snd_pcm_sw_params_free (sw_params);
     }
-    if (audio != NULL) {
+    if (spawn && audio != NULL) {
         palsa_free ();
     }
 
@@ -533,7 +480,7 @@ palsa_setformat (ddb_waveformat_t *fmt) {
 }
 
 static int
-palsa_free (void) {
+palsa_free () {
     trace ("palsa_free\n");
     LOCK;
     if (!alsa_tid) {
@@ -569,7 +516,7 @@ palsa_play (void) {
     int err = 0;
     LOCK;
     if (!audio) {
-        err = palsa_init ();
+        err = palsa_init (1);
     }
     if (err < 0) {
         UNLOCK;
@@ -616,7 +563,7 @@ palsa_pause (void) {
     int err = 0;
     LOCK;
     if (!audio) {
-        err = palsa_init ();
+        err = palsa_init (1);
     }
     if (err < 0) {
         UNLOCK;
@@ -634,7 +581,7 @@ palsa_unpause (void) {
     // unset pause state
     LOCK;
     if (!audio) {
-        if (palsa_init ()) {
+        if (palsa_init (1)) {
             UNLOCK;
             return -1;
         }
@@ -694,7 +641,18 @@ palsa_thread (void *context) {
         // setformat
         int res = 0;
         if (_setformat_requested) {
-            res = _setformat_apply ();   
+            snd_pcm_drop(audio);
+            snd_pcm_close(audio);
+            int prev_state = state;
+            palsa_init(0);
+            res = _setformat_apply ();
+            trace ("setformat res %d\n", res);
+            snd_pcm_prepare(audio);   
+            if (prev_state == DDB_PLAYBACK_STATE_PLAYING) {
+                snd_pcm_start(audio);
+                state = DDB_PLAYBACK_STATE_PLAYING;
+            }         
+            
         }
 
         if (res != 0) {
@@ -708,7 +666,7 @@ palsa_thread (void *context) {
         // wait for buffer
         avail = snd_pcm_avail_update (audio);
         if (avail < 0) {
-            //fprintf (stderr, "snd_pcm_avail_update err %d (%s)\n", avail, snd_strerror (avail));
+            fprintf (stderr, "snd_pcm_avail_update err %d (%s)\n", avail, snd_strerror (avail));
             avail = alsa_recover (avail);
         }
         if (avail < 0) {
@@ -872,6 +830,8 @@ static const char settings_dlg[] =
     "property \"Preferred period size\" entry alsa.period " DEFAULT_PERIOD_SIZE_STR ";\n"
 ;
 
+int palsa_init_spawn() { return palsa_init(1); }
+
 // define plugin interface
 static DB_output_t plugin = {
     DDB_PLUGIN_SET_API_VERSION
@@ -904,7 +864,7 @@ static DB_output_t plugin = {
     .plugin.stop = alsa_stop,
     .plugin.configdialog = settings_dlg,
     .plugin.message = alsa_message,
-    .init = palsa_init,
+    .init = palsa_init_spawn,
     .free = palsa_free,
     .setformat = palsa_setformat,
     .play = palsa_play,
